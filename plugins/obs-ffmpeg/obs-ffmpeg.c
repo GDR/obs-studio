@@ -21,6 +21,7 @@ extern struct obs_output_info  replay_buffer;
 extern struct obs_encoder_info aac_encoder_info;
 extern struct obs_encoder_info opus_encoder_info;
 extern struct obs_encoder_info nvenc_encoder_info;
+extern struct obs_encoder_info vaapi_encoder_info;
 
 #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(55, 27, 100)
 #define LIBAVUTIL_VAAPI_AVAILABLE
@@ -171,13 +172,11 @@ cleanup:
 
 #endif
 
-#ifdef LIBAVUTIL_VAAPI_AVAILABLE
 static bool vaapi_supported(void)
 {
 	AVCodec *vaenc = avcodec_find_encoder_by_name("h264_vaapi");
 	return !!vaenc;
 }
-#endif
 
 bool obs_module_load(void)
 {
@@ -204,6 +203,10 @@ bool obs_module_load(void)
 	}
 #endif
 #endif
+	if (vaapi_supported()) {
+		blog(LOG_INFO, "FFMPEG VAAPI supported");
+		obs_register_encoder(&vaapi_encoder_info);
+	}
 	return true;
 }
 

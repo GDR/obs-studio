@@ -15,10 +15,6 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 ******************************************************************************/
 
-#include <libavutil/avutil.h>
-
-#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(55, 27, 100)
-
 #include <util/darray.h>
 #include <util/dstr.h>
 #include <util/base.h>
@@ -31,7 +27,7 @@
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/hwcontext.h>
-#include <libavcodec/avcodec.h>
+#include <libavutil/hwcontext_vaapi.h>
 #include <libavformat/avformat.h>
 #include <libavfilter/avfilter.h>
 
@@ -41,32 +37,33 @@
 	blog(level, "[FFMPEG VAAPI encoder: '%s'] " format, \
 			obs_encoder_get_name(enc->encoder), ##__VA_ARGS__)
 
-#define warn(format, ...) do_log(LOG_WARNING, format, ##__VA_ARGS__)
-#define info(format, ...) do_log(LOG_INFO, format, ##__VA_ARGS__)
-#define debug(format, ...) do_log(LOG_DEBUG, format, ##__VA_ARGS__)
+#define warn(format, ...)  do_log(LOG_WARNING, format, ##__VA_ARGS__)
+#define info(format, ...)  do_log(LOG_INFO,    format, ##__VA_ARGS__)
+#define debug(format, ...) do_log(LOG_DEBUG,   format, ##__VA_ARGS__)
 
 struct vaapi_encoder {
-	obs_encoder_t *encoder;
+	obs_encoder_t                  *encoder;
 
-	AVBufferRef *vadevice_ref;
-	AVBufferRef *vaframes_ref;
+	AVBufferRef                    *vadevice_ref;
+	AVBufferRef                    *vaframes_ref;
 
-	AVCodec *       vaapi;
-	AVCodecContext *context;
+	AVCodec                        *vaapi;
+	AVCodecContext                 *context;
 
-	AVFrame *vframe;
+	AVPicture                      dst_picture;
+	AVFrame                        *vframe;
 
-	DARRAY(uint8_t) buffer;
+	DARRAY(uint8_t)                buffer;
 
-	uint8_t *header;
-	size_t   header_size;
+	uint8_t                        *header;
+	size_t                         header_size;
 
-	uint8_t *sei;
-	size_t   sei_size;
+	uint8_t                        *sei;
+	size_t                         sei_size;
 
-	int  height;
-	bool first_packet;
-	bool initialized;
+	int                            height;
+	bool                           first_packet;
+	bool                           initialized;
 };
 
 static const char *vaapi_getname(void *unused)
@@ -83,13 +80,13 @@ static inline bool valid_format(enum video_format format)
 static void vaapi_video_info(void *data, struct video_scale_info *info)
 {
 	struct vaapi_encoder *enc = data;
-	enum video_format     pref_format;
+	enum video_format pref_format;
 
 	pref_format = obs_encoder_get_preferred_video_format(enc->encoder);
 
 	if (!valid_format(pref_format)) {
-		pref_format = valid_format(info->format) ? info->format
-							 : VIDEO_FORMAT_NV12;
+		pref_format = valid_format(info->format) ?
+			info->format : VIDEO_FORMAT_NV12;
 	}
 
 	info->format = pref_format;
@@ -99,11 +96,9 @@ static bool vaapi_init_codec(struct vaapi_encoder *enc, const char *path)
 {
 	int ret;
 
-	ret = av_hwdevice_ctx_create(&enc->vadevice_ref, AV_HWDEVICE_TYPE_VAAPI,
-			path, NULL, 0);
+	ret = av_hwdevice_ctx_create(&enc->vadevice_ref, AV_HWDEVICE_TYPE_VAAPI, path, NULL, 0);
 	if (ret < 0) {
-		warn("Failed to create VAAPI device context: %s",
-				av_err2str(ret));
+		warn("Failed to create VAAPI device context: %s", av_err2str(ret));
 		return false;
 	}
 
@@ -113,16 +108,15 @@ static bool vaapi_init_codec(struct vaapi_encoder *enc, const char *path)
 		return false;
 	}
 
-	AVHWFramesContext *frames_ctx =
-			(AVHWFramesContext *)enc->vaframes_ref->data;
-	frames_ctx->format            = AV_PIX_FMT_VAAPI;
-	frames_ctx->sw_format         = AV_PIX_FMT_NV12;
-	frames_ctx->width             = enc->context->width;
-	frames_ctx->height            = enc->context->height;
+	AVHWFramesContext *frames_ctx = (AVHWFramesContext*)enc->vaframes_ref->data;
+	frames_ctx->format = AV_PIX_FMT_VAAPI;
+	frames_ctx->sw_format = AV_PIX_FMT_NV12;
+	frames_ctx->width = enc->context->width;
+	frames_ctx->height = enc->context->height;
 	frames_ctx->initial_pool_size = 20;
 
 	ret = av_hwframe_ctx_init(enc->vaframes_ref);
-	if (ret < 0) {
+	if (ret < 0 ) {
 		warn("Failed to init HW frames context: %s", av_err2str(ret));
 		return false;
 	}
@@ -135,19 +129,21 @@ static bool vaapi_init_codec(struct vaapi_encoder *enc, const char *path)
 	}
 
 	enc->vframe->format = enc->context->pix_fmt;
-	enc->vframe->width  = enc->context->width;
+	enc->vframe->width = enc->context->width;
 	enc->vframe->height = enc->context->height;
-	enc->vframe->colorspace  = enc->context->colorspace;
+
+	enc->vframe->colorspace = enc->context->colorspace;
 	enc->vframe->color_range = enc->context->color_range;
 
-	ret = av_frame_get_buffer(enc->vframe, base_get_alignment());
+	ret = avpicture_alloc(&enc->dst_picture, enc->context->pix_fmt,
+			enc->context->width, enc->context->height);
 	if (ret < 0) {
-		warn("Failed to allocate vframe: %s", av_err2str(ret));
+		warn("Failed to allocate dst_picture: %s", av_err2str(ret));
 		return false;
 	}
 
 	/* 3. set up codec */
-	enc->context->pix_fmt       = AV_PIX_FMT_VAAPI;
+	enc->context->pix_fmt = AV_PIX_FMT_VAAPI;
 	enc->context->hw_frames_ctx = av_buffer_ref(enc->vaframes_ref);
 
 	ret = avcodec_open2(enc->context, enc->vaapi, NULL);
@@ -157,6 +153,8 @@ static bool vaapi_init_codec(struct vaapi_encoder *enc, const char *path)
 	}
 
 	enc->initialized = true;
+
+	*((AVPicture*)enc->vframe) = enc->dst_picture;
 	return true;
 }
 
@@ -166,49 +164,49 @@ static bool vaapi_update(void *data, obs_data_t *settings)
 
 	const char *device = obs_data_get_string(settings, "vaapi_device");
 
-	int profile = (int)obs_data_get_int(settings, "profile");
-	int bf      = (int)obs_data_get_int(settings, "bf");
+	int codec = (int)obs_data_get_string(settings, "vaapi_codec");
 
-	int level      = (int)obs_data_get_int(settings, "level");
-	int bitrate    = (int)obs_data_get_int(settings, "bitrate");
+	int profile = (int)obs_data_get_int(settings, "profile");
+	int bf = (int)obs_data_get_int(settings, "bf");
+
+	int level = (int)obs_data_get_int(settings, "level");
+	int bitrate = (int)obs_data_get_int(settings, "bitrate");
 	int keyint_sec = (int)obs_data_get_int(settings, "keyint_sec");
 
-	int qp      = (int)obs_data_get_int(settings, "qp");
+	int qp = (int)obs_data_get_int(settings, "qp");
 	int quality = (int)obs_data_get_int(settings, "quality");
 
 	av_opt_set_int(enc->context->priv_data, "qp", qp, 0);
 	av_opt_set_int(enc->context->priv_data, "quality", quality, 0);
 
-	video_t *                       video = obs_encoder_video(enc->encoder);
-	const struct video_output_info *voi   = video_output_get_info(video);
-	struct video_scale_info         info;
 
-	info.format     = voi->format;
+	video_t *video = obs_encoder_video(enc->encoder);
+	const struct video_output_info *voi = video_output_get_info(video);
+	struct video_scale_info info;
+
+	info.format = voi->format;
 	info.colorspace = voi->colorspace;
-	info.range      = voi->range;
+	info.range = voi->range;
 
 	vaapi_video_info(enc, &info);
 
-	enc->context->profile      = profile;
+	enc->context->profile = profile;
 	enc->context->max_b_frames = bf;
-	enc->context->level        = level;
-	enc->context->bit_rate     = bitrate * 1000;
+	enc->context->level = level;
+	enc->context->bit_rate = bitrate * 1000;
 
-	enc->context->width  = obs_encoder_get_width(enc->encoder);
+	enc->context->width = obs_encoder_get_width(enc->encoder);
 	enc->context->height = obs_encoder_get_height(enc->encoder);
 
-	enc->context->time_base  = (AVRational){voi->fps_den, voi->fps_num};
-	enc->context->pix_fmt    = obs_to_ffmpeg_video_format(info.format);
-	enc->context->colorspace = info.colorspace == VIDEO_CS_709
-			? AVCOL_SPC_BT709
-			: AVCOL_SPC_BT470BG;
-	enc->context->color_range = info.range == VIDEO_RANGE_FULL
-			? AVCOL_RANGE_JPEG
-			: AVCOL_RANGE_MPEG;
+	enc->context->time_base = (AVRational){voi->fps_den, voi->fps_num};
+	enc->context->pix_fmt = obs_to_ffmpeg_video_format(info.format);
+	enc->context->colorspace = info.colorspace == VIDEO_CS_709 ?
+		AVCOL_SPC_BT709 : AVCOL_SPC_BT470BG;
+	enc->context->color_range = info.range == VIDEO_RANGE_FULL ?
+		AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
 
 	if (keyint_sec > 0) {
-		enc->context->gop_size =
-				keyint_sec * voi->fps_num / voi->fps_den;
+		enc->context->gop_size = keyint_sec * voi->fps_num / voi->fps_den;
 	} else {
 		enc->context->gop_size = 120;
 	}
@@ -226,9 +224,10 @@ static bool vaapi_update(void *data, obs_data_t *settings)
 	     "\twidth:        %d\n"
 	     "\theight:       %d\n"
 	     "\tb-frames:     %d\n",
-			device, qp, quality, profile, level, bitrate,
-			enc->context->gop_size, enc->context->width,
-			enc->context->height, enc->context->max_b_frames);
+             device, qp, quality, profile, level,
+	     bitrate, enc->context->gop_size,
+	     enc->context->width, enc->context->height,
+	     enc->context->max_b_frames);
 
 	return vaapi_init_codec(enc, device);
 }
@@ -238,27 +237,22 @@ static void vaapi_destroy(void *data)
 	struct vaapi_encoder *enc = data;
 
 	if (enc->initialized) {
-		AVPacket pkt   = {0};
-		int      r_pkt = 1;
+		AVPacket pkt = {0};
+		int r_pkt = 1;
 
 		while (r_pkt) {
-#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(57, 40, 101)
-			if (avcodec_receive_packet(enc->context, &pkt) < 0)
-				break;
-#else
 			if (avcodec_encode_video2(enc->context, &pkt, NULL,
-					    &r_pkt) < 0)
+						&r_pkt) < 0)
 				break;
-#endif
 
 			if (r_pkt)
-				av_packet_unref(&pkt);
+				av_free_packet(&pkt);
 		}
 	}
 
 	avcodec_close(enc->context);
-	av_frame_unref(enc->vframe);
 	av_frame_free(&enc->vframe);
+	avpicture_free(&enc->dst_picture);
 	av_buffer_unref(&enc->vaframes_ref);
 	av_buffer_unref(&enc->vadevice_ref);
 	da_free(enc->buffer);
@@ -273,12 +267,12 @@ static void *vaapi_create(obs_data_t *settings, obs_encoder_t *encoder)
 	struct vaapi_encoder *enc;
 	avcodec_register_all();
 
-	enc          = bzalloc(sizeof(*enc));
+	enc = bzalloc(sizeof(*enc));
 	enc->encoder = encoder;
 
 	int vaapi_codec = (int)obs_data_get_int(settings, "vaapi_codec");
 
-	if (vaapi_codec == AV_CODEC_ID_H264) {
+	if(vaapi_codec==AV_CODEC_ID_H264) {
 		enc->vaapi = avcodec_find_encoder_by_name("h264_vaapi");
 	}
 
@@ -307,20 +301,19 @@ fail:
 	return NULL;
 }
 
-static inline void copy_data(AVFrame *pic, const struct encoder_frame *frame,
+static inline void copy_data(AVPicture *pic, const struct encoder_frame *frame,
 		int height, enum AVPixelFormat format)
 {
 	int h_chroma_shift, v_chroma_shift;
-	av_pix_fmt_get_chroma_sub_sample(
-			format, &h_chroma_shift, &v_chroma_shift);
+	av_pix_fmt_get_chroma_sub_sample(format, &h_chroma_shift, &v_chroma_shift);
 	for (int plane = 0; plane < MAX_AV_PLANES; plane++) {
 		if (!frame->data[plane])
 			continue;
 
 		int frame_rowsize = (int)frame->linesize[plane];
 		int pic_rowsize   = pic->linesize[plane];
-		int bytes         = frame_rowsize < pic_rowsize ? frame_rowsize
-							: pic_rowsize;
+		int bytes = frame_rowsize < pic_rowsize ?
+			frame_rowsize : pic_rowsize;
 		int plane_height = height >> (plane ? v_chroma_shift : 0);
 
 		for (int y = 0; y < plane_height; y++) {
@@ -328,7 +321,8 @@ static inline void copy_data(AVFrame *pic, const struct encoder_frame *frame,
 			int pos_pic   = y * pic_rowsize;
 
 			memcpy(pic->data[plane] + pos_pic,
-					frame->data[plane] + pos_frame, bytes);
+			       frame->data[plane] + pos_frame,
+			       bytes);
 		}
 	}
 }
@@ -336,11 +330,11 @@ static inline void copy_data(AVFrame *pic, const struct encoder_frame *frame,
 static bool vaapi_encode(void *data, struct encoder_frame *frame,
 		struct encoder_packet *packet, bool *received_packet)
 {
-	struct vaapi_encoder *enc     = data;
-	AVFrame *             hwframe = NULL;
-	AVPacket              av_pkt;
-	int                   got_packet;
-	int                   ret;
+	struct vaapi_encoder *enc = data;
+	AVFrame *hwframe;
+	AVPacket av_pkt;
+	int got_packet;
+	int ret;
 
 	hwframe = av_frame_alloc();
 	if (!hwframe) {
@@ -350,62 +344,47 @@ static bool vaapi_encode(void *data, struct encoder_frame *frame,
 
 	ret = av_hwframe_get_buffer(enc->vaframes_ref, hwframe, 0);
 	if (ret < 0) {
-		warn("vaapi_encode: failed to get buffer for hw frame: %s",
-				av_err2str(ret));
-		goto fail;
+		warn("vaapi_encode: failed to get buffer for hw frame: %s", av_err2str(ret));
+		return false;
 	}
 
-	copy_data(enc->vframe, frame, enc->height, enc->context->pix_fmt);
-
+	copy_data(&enc->dst_picture, frame, enc->height, enc->context->pix_fmt);
 	enc->vframe->pts = frame->pts;
-	hwframe->pts     = frame->pts;
-	hwframe->width   = enc->vframe->width;
-	hwframe->height  = enc->vframe->height;
+	hwframe->pts = frame->pts;
+	hwframe->width = enc->vframe->width;
+	hwframe->height = enc->vframe->height;
 
 	ret = av_hwframe_transfer_data(hwframe, enc->vframe, 0);
 	if (ret < 0) {
-		warn("vaapi_encode: failed to upload hw frame: %s",
-				av_err2str(ret));
-		goto fail;
+		warn("vaapi_encode: failed to upload hw frame: %s", av_err2str(ret));
+		return false;
 	}
 
 	ret = av_frame_copy_props(hwframe, enc->vframe);
 	if (ret < 0) {
-		warn("vaapi_encode: failed to copy props to hw frame: %s",
-				av_err2str(ret));
-		goto fail;
+		warn("vaapi_encode: failed to copy props to hw frame: %s", av_err2str(ret));
+		return false;
 	}
 
 	av_init_packet(&av_pkt);
 
-#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(57, 40, 101)
-	ret = avcodec_send_frame(enc->context, hwframe);
-	if (ret == 0)
-		ret = avcodec_receive_packet(enc->context, &av_pkt);
-
-	got_packet = (ret == 0);
-
-	if (ret == AVERROR_EOF || ret == AVERROR(EAGAIN))
-		ret = 0;
-#else
-	ret = avcodec_encode_video2(
-			enc->context, &av_pkt, hwframe, &got_packet);
-#endif
+	ret = avcodec_encode_video2(enc->context, &av_pkt, hwframe,
+			&got_packet);
 	if (ret < 0) {
 		warn("vaapi_encode: Error encoding: %s", av_err2str(ret));
-		goto fail;
+		return false;
 	}
 
 	if (got_packet && av_pkt.size) {
 		if (enc->first_packet) {
 			uint8_t *new_packet;
-			size_t   size;
+			size_t size;
 
 			enc->first_packet = false;
 			obs_extract_avc_headers(av_pkt.data, av_pkt.size,
-					&new_packet, &size, &enc->header,
-					&enc->header_size, &enc->sei,
-					&enc->sei_size);
+					&new_packet, &size,
+					&enc->header, &enc->header_size,
+					&enc->sei, &enc->sei_size);
 
 			da_copy_array(enc->buffer, new_packet, size);
 			bfree(new_packet);
@@ -413,24 +392,20 @@ static bool vaapi_encode(void *data, struct encoder_frame *frame,
 			da_copy_array(enc->buffer, av_pkt.data, av_pkt.size);
 		}
 
-		packet->pts      = av_pkt.pts;
-		packet->dts      = av_pkt.dts;
-		packet->data     = enc->buffer.array;
-		packet->size     = enc->buffer.num;
-		packet->type     = OBS_ENCODER_VIDEO;
+		packet->pts = av_pkt.pts;
+		packet->dts = av_pkt.dts;
+		packet->data = enc->buffer.array;
+		packet->size = enc->buffer.num;
+		packet->type = OBS_ENCODER_VIDEO;
 		packet->keyframe = obs_avc_keyframe(packet->data, packet->size);
 		*received_packet = true;
 	} else {
 		*received_packet = false;
 	}
 
-	av_packet_unref(&av_pkt);
+	av_free_packet(&av_pkt);
 	av_frame_free(&hwframe);
 	return true;
-
-fail:
-	av_frame_free(&hwframe);
-	return false;
 }
 
 static void set_visible(obs_properties_t *ppts, const char *name, bool visible)
@@ -439,13 +414,12 @@ static void set_visible(obs_properties_t *ppts, const char *name, bool visible)
 	obs_property_set_visible(p, visible);
 }
 
+
 static void vaapi_defaults(obs_data_t *settings)
 {
-	obs_data_set_default_string(
-			settings, "vaapi_device", "/dev/dri/renderD128");
+	obs_data_set_default_string(settings, "vaapi_device", "/dev/dri/renderD128");
 	obs_data_set_default_int(settings, "vaapi_codec", AV_CODEC_ID_H264);
-	obs_data_set_default_int(settings, "profile",
-			FF_PROFILE_H264_CONSTRAINED_BASELINE);
+	obs_data_set_default_int(settings, "profile", 578);
 	obs_data_set_default_int(settings, "level", 40);
 	obs_data_set_default_int(settings, "bitrate", 2500);
 	obs_data_set_default_int(settings, "keyint_sec", 0);
@@ -460,7 +434,7 @@ static obs_properties_t *vaapi_properties(void *unused)
 	UNUSED_PARAMETER(unused);
 
 	obs_properties_t *props = obs_properties_create();
-	obs_property_t *  list;
+	obs_property_t *list;
 
 	list = obs_properties_add_list(props, "vaapi_device", "VAAPI Device",
 			OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
@@ -469,7 +443,7 @@ static obs_properties_t *vaapi_properties(void *unused)
 		sprintf(path, "/dev/dri/renderD1%d", i);
 		if (access(path, F_OK) == 0) {
 			char card[128] = "Card: ";
-			sprintf(card, "Card%d: %s", i - 28, path);
+			sprintf(card, "Card%d: %s", i-28, path);
 			obs_property_list_add_string(list, card, path);
 		} else {
 			break;
@@ -485,17 +459,15 @@ static obs_properties_t *vaapi_properties(void *unused)
 			OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(list, "480p30 (3.0)", 30);
 	obs_property_list_add_int(list, "720p30/480p60  (3.1)", 31);
-	obs_property_list_add_int(
-			list, "Compatibility mode  (4.0 default)", 40);
+	obs_property_list_add_int(list, "Compatibility mode  (4.0 default)", 40);
 	obs_property_list_add_int(list, "720p60/1080p30 (4.1)", 41);
 	obs_property_list_add_int(list, "1080p60 (4.2)", 42);
 
-	obs_properties_add_int(props, "bitrate", obs_module_text("Bitrate"), 0,
-			300000, 50);
+	obs_properties_add_int(props, "bitrate",
+			obs_module_text("Bitrate"), 0, 300000, 50);
 
 	obs_properties_add_int(props, "keyint_sec",
-			obs_module_text("Keyframe Interval (seconds)"), 0, 20,
-			1);
+			obs_module_text("Keyframe Interval (seconds)"), 0, 20, 1);
 
 	return props;
 }
@@ -518,6 +490,7 @@ static bool vaapi_sei_data(void *data, uint8_t **extra_data, size_t *size)
 	return true;
 }
 
+
 struct obs_encoder_info vaapi_encoder_info = {
 	.id             = "ffmpeg_vaapi",
 	.type           = OBS_ENCODER_VIDEO,
@@ -532,5 +505,3 @@ struct obs_encoder_info vaapi_encoder_info = {
 	.get_sei_data   = vaapi_sei_data,
 	.get_video_info = vaapi_video_info
 };
-
-#endif
